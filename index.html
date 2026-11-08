@@ -289,7 +289,10 @@ button{font-family:inherit}
 })();
 </script>
 <script type="module">
-import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js';
+/* three.js r160 je pribalený v ./vendor (GitHub Pages nemusí siahať na CDN); doplnky importujú ten istý súbor */
+import * as THREE from './vendor/three/three.module.min.js';
+import { GLTFLoader } from './vendor/three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from './vendor/three/addons/libs/meshopt_decoder.module.js';
 
 /* ================= utility ================= */
 const TAU = Math.PI * 2;
@@ -770,23 +773,208 @@ const MAT = {
   tube: new THREE.MeshBasicMaterial({ color: 0xeef4ff }),
 };
 
-/* rim shader pre Školníka a ďalšie bytosti zo svetla */
-function rimMaterial(core, rim) {
-  return new THREE.ShaderMaterial({
-    uniforms: { uCore: { value: new THREE.Color(core) }, uRim: { value: new THREE.Color(rim) }, uOpacity: { value: 1 }, uTime: { value: 0 }, uGain: { value: 1 } },
-    vertexShader: `varying vec3 vN; varying vec3 vV; varying float vY;
-      void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); vN = normalize(normalMatrix * normal); vV = normalize(-mv.xyz); vY = (modelMatrix * vec4(position,1.0)).y;
-      gl_Position = projectionMatrix * mv; }`,
-    fragmentShader: `uniform vec3 uCore; uniform vec3 uRim; uniform float uOpacity; uniform float uTime; uniform float uGain;
-      varying vec3 vN; varying vec3 vV; varying float vY;
-      void main(){ float f = 1.0 - max(dot(normalize(vN), normalize(vV)), 0.0); f = pow(f, 2.6);
-      float sh = 0.82 + 0.18 * sin(vY * 13.0 - uTime * 2.2);
-      vec3 col = uCore + uRim * (f * 2.3 * sh + 0.015) * uGain;
-      gl_FragColor = vec4(col, uOpacity);
-      #include <tonemapping_fragment>
-      #include <colorspace_fragment>
-      }`,
-    transparent: true,
+/* ================= duchovia: Boltzmannove mozgy =================
+   Školník aj Ema sú náhodné fluktuácie, ktoré sa na chvíľu poskladali z chaosu. Preto sú zo svetla:
+   okrajová žiara, slabá „spomienka" na farby modelu, diery v šume, ktoré sa pomaly rozpadajú a znova skladajú,
+   občasný preskok vodorovného pásu a iskričky, ktoré sa z povrchu odparujú. Všetko poháňa iba čas (uTime),
+   nie počet snímok, takže efekt beží rovnako pri 30, 60 aj 144 Hz. */
+const GHOST_NOISE = `
+  float gh(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+  float gn(vec3 x){ vec3 i = floor(x); vec3 f = fract(x); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(gh(i), gh(i + vec3(1.0, 0.0, 0.0)), f.x), mix(gh(i + vec3(0.0, 1.0, 0.0)), gh(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+               mix(mix(gh(i + vec3(0.0, 0.0, 1.0)), gh(i + vec3(1.0, 0.0, 1.0)), f.x), mix(gh(i + vec3(0.0, 1.0, 1.0)), gh(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z); }
+  float gfbm(vec3 p){ return gn(p) * 0.58 + gn(p * 2.07 + 7.7) * 0.29 + gn(p * 4.31 + 3.1) * 0.13; }
+`;
+const GHOST_VERT = `uniform float uTime; uniform float uH; uniform float uSeed; uniform float uWob; uniform float uFade;
+  varying vec3 vN; varying vec3 vV; varying vec3 vP; varying vec2 vUv; varying float vSlip;
+  ${GHOST_NOISE}
+  void main(){
+    vec3 p = position;
+    /* dýchanie: povrch sa nepatrne vlní pozdĺž normály, pri miznutí viac */
+    p += normal * (gn(p * 5.0 + vec3(uSeed, uTime * 0.6, -uTime * 0.25)) - 0.5) * (uWob + uFade * 0.05);
+    /* občasný preskok: vodorovný pás tela sa na zlomok sekundy posunie nabok, akoby sa fluktuácia pomýlila */
+    float slot = floor(uTime * 2.3 + uSeed * 13.0);
+    float ev = step(0.9, gh(vec3(slot, uSeed * 7.0, 3.0)));
+    float band = ev * (1.0 - smoothstep(0.0, 0.045 * uH, abs(p.y - gh(vec3(slot, 1.0, uSeed)) * uH)));
+    p.x += band * (gh(vec3(slot, 2.0, uSeed)) - 0.5) * 0.09;
+    vSlip = band; vP = position; vUv = uv;
+    vec4 mv = modelViewMatrix * vec4(p, 1.0);
+    vN = normalize(normalMatrix * normal); vV = -mv.xyz;
+    gl_Position = projectionMatrix * mv;
+  }`;
+const GHOST_FRAG = `uniform vec3 uCore; uniform vec3 uRim; uniform float uOpacity; uniform float uTime; uniform float uGain; uniform float uH; uniform float uSeed; uniform float uFade;
+  uniform sampler2D uMap; uniform float uMapMix; uniform float uHole;
+  varying vec3 vN; varying vec3 vV; varying vec3 vP; varying vec2 vUv; varying float vSlip;
+  ${GHOST_NOISE}
+  void main(){
+    float hgt = clamp(vP.y / uH, 0.0, 1.0);
+    /* fluktuácia: v pomaly plávajúcom šume chýbajú kúsky tela; pri nohách a pri miznutí ich chýba viac */
+    float n = gfbm(vP * 9.0 + vec3(uSeed * 3.1, -uTime * 0.42, uTime * 0.17));
+    float thr = uHole + (1.0 - smoothstep(0.02, 0.2, hgt)) * 0.3 + uFade * 0.62;
+    if (n < thr) discard;
+  #ifdef GHOST_DEPTH
+    gl_FragColor = vec4(0.0);
+  #else
+    float edge = 1.0 - smoothstep(0.0, 0.05, n - thr);
+    float f = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 2.3);
+    float sh = 0.8 + 0.2 * sin(vP.y * 38.0 - uTime * 2.6);
+    /* spomienka na farby: odfarbená a sfarbená do svetla postavy */
+    vec3 tex = texture2D(uMap, vUv).rgb;
+    float l = dot(tex, vec3(0.299, 0.587, 0.114));
+    vec3 mem = mix(vec3(l), tex, 0.5) * mix(vec3(1.0), uRim * 1.4, 0.45);
+    vec3 col = uCore + mem * uMapMix * sh + uRim * (f * 2.2 * sh + 0.04 + edge * 1.8 + vSlip * 0.6) * uGain;
+    float a = clamp(0.32 + l * uMapMix * 0.35 + f * 0.95 + edge * 0.7, 0.0, 1.0) * uOpacity;
+    gl_FragColor = vec4(col, a);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  #endif
+  }`;
+const WHITE_TEX = (() => { const t = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1); t.needsUpdate = true; return t; })();
+/* spoločné uniformy jednej bytosti (telo, metla aj iskričky); hodnoty mení príbeh: uOpacity, uGain, uFade, uTime */
+function ghostUniforms(core, rim) {
+  return { uCore: { value: new THREE.Color(core) }, uRim: { value: new THREE.Color(rim) }, uOpacity: { value: 1 }, uTime: { value: 0 }, uGain: { value: 1 }, uFade: { value: 0 } };
+}
+/* dvojica sietí: najprv iba hĺbka (aby priesvitné telo nekreslilo vlastné vnútorné steny), potom priesvitná farba */
+function ghostPair(geo, U, map, h, seed, o = {}) {
+  const uni = Object.assign({}, U, { uMap: { value: map || WHITE_TEX }, uMapMix: { value: map ? (o.mapMix ?? 0.5) : 0 }, uH: { value: h }, uSeed: { value: seed }, uWob: { value: o.wob ?? 0.004 }, uHole: { value: o.hole ?? 0.16 } });
+  const base = { uniforms: uni, vertexShader: GHOST_VERT, fragmentShader: GHOST_FRAG, transparent: true };
+  const depth = new THREE.ShaderMaterial(Object.assign({ defines: { GHOST_DEPTH: 1 }, colorWrite: false, depthWrite: true, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }, base));
+  const color = new THREE.ShaderMaterial(Object.assign({ depthWrite: false }, base));
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(geo, depth)); g.add(new THREE.Mesh(geo, color));
+  return { g, mat: color };
+}
+/* náhodné body na povrchu (podľa plochy trojuholníkov) s normálami */
+function surfacePoints(geo, n, seed) {
+  const P = geo.attributes.position, Nn = geo.attributes.normal, I = geo.index, tc = (I ? I.count : P.count) / 3;
+  const vi = k => (I ? I.getX(k) : k), cum = new Float64Array(tc);
+  const a = V3(), b = V3(), c = V3(), e1 = V3(), e2 = V3();
+  let tot = 0;
+  for (let t = 0; t < tc; t++) { a.fromBufferAttribute(P, vi(t * 3)); b.fromBufferAttribute(P, vi(t * 3 + 1)); c.fromBufferAttribute(P, vi(t * 3 + 2)); tot += e1.subVectors(b, a).cross(e2.subVectors(c, a)).length() * 0.5; cum[t] = tot; }
+  const R = mulberry32(seed), pos = new Float32Array(n * 3), nor = new Float32Array(n * 3), sd = new Float32Array(n), na = V3(), nb = V3(), nc = V3();
+  for (let i = 0; i < n; i++) {
+    const r = R() * tot; let lo = 0, hi = tc - 1;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (cum[m] < r) lo = m + 1; else hi = m; }
+    let u = R(), v = R(); if (u + v > 1) { u = 1 - u; v = 1 - v; }
+    const i0 = vi(lo * 3), i1 = vi(lo * 3 + 1), i2 = vi(lo * 3 + 2);
+    a.fromBufferAttribute(P, i0); b.fromBufferAttribute(P, i1); c.fromBufferAttribute(P, i2);
+    pos.set([a.x + (b.x - a.x) * u + (c.x - a.x) * v, a.y + (b.y - a.y) * u + (c.y - a.y) * v, a.z + (b.z - a.z) * u + (c.z - a.z) * v], i * 3);
+    if (Nn) { na.fromBufferAttribute(Nn, i0); nb.fromBufferAttribute(Nn, i1); nc.fromBufferAttribute(Nn, i2); na.multiplyScalar(1 - u - v).addScaledVector(nb, u).addScaledVector(nc, v).normalize(); }
+    else na.set(0, 1, 0);
+    nor.set([na.x, na.y, na.z], i * 3); sd[i] = R();
+  }
+  return { pos, nor, sd };
+}
+/* iskričky, ktoré sa odparujú z povrchu bytosti a hasnú; pri miznutí (uFade) odletujú ďalej */
+function ghostMotes(geo, U, n, seed) {
+  const s = surfacePoints(geo, n, seed), pg = new THREE.BufferGeometry();
+  pg.setAttribute('position', new THREE.BufferAttribute(s.pos, 3)); pg.setAttribute('aNor', new THREE.BufferAttribute(s.nor, 3)); pg.setAttribute('aSeed', new THREE.BufferAttribute(s.sd, 1));
+  pg.computeBoundingSphere(); pg.boundingSphere.radius += 0.5;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uTime: U.uTime, uOpacity: U.uOpacity, uFade: U.uFade, uRim: U.uRim, uPR: { value: renderer.getPixelRatio() } },
+    vertexShader: `attribute vec3 aNor; attribute float aSeed; uniform float uTime; uniform float uPR; uniform float uFade; varying float vA;
+      void main(){
+        float t = fract(uTime * (0.16 + 0.2 * fract(aSeed * 7.31)) + aSeed);
+        vec3 dir = normalize(aNor * 0.8 + vec3(sin(aSeed * 91.0) * 0.3, 0.9, cos(aSeed * 53.0) * 0.3));
+        vec3 p = position + dir * t * (0.08 + 0.3 * uFade + 0.06 * fract(aSeed * 3.7));
+        p.xz += vec2(sin(uTime * 0.9 + aSeed * 20.0), cos(uTime * 0.8 + aSeed * 17.0)) * 0.02 * t;
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        vA = sin(t * 3.14159) * (0.55 + 0.45 * fract(aSeed * 13.1));
+        gl_PointSize = clamp(uPR * 9.0 / max(-mv.z, 0.2), 1.0, 8.0 * uPR) * (1.0 - 0.4 * t);
+        gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: `uniform vec3 uRim; uniform float uOpacity; varying float vA;
+      void main(){ float d = length(gl_PointCoord - 0.5) * 2.0; if (d > 1.0) discard; float a = pow(1.0 - d, 1.6) * vA * uOpacity;
+        gl_FragColor = vec4(uRim * a * 1.2, 1.0); }`,
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false,
+  });
+  return new THREE.Points(pg, mat);
+}
+
+/* ================= 3D modely z Higgsfieldu =================
+   Postavy (Tripo H3.1) a predmety (SAM 3D) vznikli z konceptov vygenerovaných v Higgsfielde,
+   potom boli zmenšené, otočené na +z, postavené na y = 0 a stlačené (meshopt, WebP). Ak sa model
+   nenačíta, hra použije pôvodný procedurálny tvar; ak príde neskôr, vymení sa za behu. */
+const MODEL_FILES = {
+  caretaker: 'caretaker', ema: 'ema', kidBoy: 'kid_boy', kidGirl: 'kid_girl', broom: 'broom',
+  piano: 'piano', bicycle: 'bicycle', slipper: 'slipper', apple: 'apple', collar: 'collar', ball: 'ball',
+  telescope: 'telescope', radio: 'radio', telephone: 'telephone',
+};
+const MODELS = {};       /* meno -> { geo, map } po načítaní, null ak zlyhalo */
+const MODEL_WAIT = {};   /* meno -> funkcie, ktoré čakajú na model */
+/* kvantizované atribúty z GLB prevedie na float, aby sa dali zapiecť transformácie bez orezania */
+function floatAttr(a) {
+  /* getX..getW poznajú aj prekladané (interleaved) atribúty, ktoré z meshopt často vzniknú */
+  const n = a.count, s = a.itemSize, out = new Float32Array(n * s), get = [a.getX, a.getY, a.getZ, a.getW];
+  for (let i = 0; i < n; i++) for (let k = 0; k < s; k++) out[i * s + k] = get[k].call(a, i);
+  return new THREE.BufferAttribute(out, s);
+}
+function loadModels() {
+  const loader = new GLTFLoader(); loader.setMeshoptDecoder(MeshoptDecoder);
+  return Promise.allSettled(Object.entries(MODEL_FILES).map(([k, file]) => loader.loadAsync(`models/${file}.glb`).then(gl => {
+    let mesh = null; gl.scene.updateMatrixWorld(true); gl.scene.traverse(o => { if (o.isMesh && !mesh) mesh = o; });
+    if (!mesh) throw new Error('no mesh in ' + file);
+    const src = mesh.geometry, geo = new THREE.BufferGeometry();
+    for (const name of ['position', 'normal', 'uv']) if (src.attributes[name]) geo.setAttribute(name, floatAttr(src.attributes[name]));
+    if (src.index) geo.setIndex(src.index.clone());
+    geo.applyMatrix4(mesh.matrixWorld);
+    if (!geo.attributes.normal) geo.computeVertexNormals();
+    geo.computeBoundingBox(); geo.computeBoundingSphere();
+    const map = mesh.material && mesh.material.map ? mesh.material.map : null;
+    if (map) { map.colorSpace = THREE.SRGBColorSpace; map.anisotropy = 4; }
+    src.dispose();
+    MODELS[k] = { geo, map };
+    const w = MODEL_WAIT[k] || []; delete MODEL_WAIT[k];
+    w.forEach(fn => { try { fn(MODELS[k]); } catch (e) { console.warn('model swap', k, e); } });
+  }).catch(e => { console.warn('model', k, e && e.message); MODELS[k] = null; delete MODEL_WAIT[k]; })));
+}
+function withModel(k, fn) { if (MODELS[k]) fn(MODELS[k]); else if (MODELS[k] !== null) (MODEL_WAIT[k] = MODEL_WAIT[k] || []).push(fn); }
+/* materiál predmetu: textúra z modelu a rovnaká maliarska granulácia ako zvyšok sveta */
+function propMat(k) {
+  const M = MODELS[k];
+  if (!M.mat) M.mat = paintify(new THREE.MeshStandardMaterial({ map: M.map, roughness: 0.82, metalness: 0 }), 0.55);
+  return M.mat;
+}
+function propMesh(k) { const m = new THREE.Mesh(MODELS[k].geo, propMat(k)); m.userData.shared = true; return m; }
+/* rozšíri maliarsky materiál o ďalšie úpravy shadera (paintify už onBeforeCompile obsadil) */
+function extendMat(m, key, fn) { const pb = m.onBeforeCompile; m.onBeforeCompile = sh => { pb(sh); fn(sh); }; m.customProgramCacheKey = () => key; m.needsUpdate = true; return m; }
+/* jablko: polovica zostane červená, druhá zozelenie, lebo Ludvík si pamätá obe farby naraz */
+function appleMat() {
+  const M = MODELS.apple;
+  if (!M.matHalf) M.matHalf = extendMat(paintify(new THREE.MeshStandardMaterial({ map: M.map, roughness: 0.55, metalness: 0 }), 0.4), 'appleHalf', sh => {
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nvarying float vAx;').replace('#include <begin_vertex>', '#include <begin_vertex>\nvAx = position.x;');
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying float vAx;').replace('#include <map_fragment>', `#include <map_fragment>
+      { vec3 c = diffuseColor.rgb; vec3 g = vec3(c.g * 0.9 + c.r * 0.28, c.r * 0.82 + c.g * 0.4, c.b * 0.5);
+        diffuseColor.rgb = mix(c, g, smoothstep(0.004, -0.004, vAx)); }`);
+  });
+  return M.matHalf;
+}
+/* spolužiaci: modré a fialové oblečenie dostane iný odtieň (pleť, vlasy ani ružový sveter sa nemenia) */
+function kidMat(k, hue) {
+  const M = MODELS[k];
+  const m = extendMat(paintify(new THREE.MeshStandardMaterial({ map: M.map, roughness: 0.85, metalness: 0 }), 0.6), 'kidHue', sh => {
+    sh.uniforms.uHue = { value: hue };
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
+      uniform float uHue;
+      vec3 rgb2hsv(vec3 c){ vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0); vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+        vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r)); float d = q.x - min(q.w, q.y); float e = 1.0e-10;
+        return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x); }
+      vec3 hsv2rgb(vec3 c){ vec3 p = abs(fract(c.xxx + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0); return c.z * clamp(p - 1.0, 0.0, 1.0); }`)
+      .replace('#include <map_fragment>', `#include <map_fragment>
+      { vec3 h = rgb2hsv(diffuseColor.rgb);
+        float w = smoothstep(0.42, 0.5, h.x) * (1.0 - smoothstep(0.86, 0.92, h.x)) * smoothstep(0.12, 0.25, h.y);
+        diffuseColor.rgb = mix(diffuseColor.rgb, hsv2rgb(vec3(fract(h.x + uHue), h.y * (uHue > 0.0 ? 0.78 : 1.0), h.z)), w); }`);
+  });
+  return m;
+}
+/* procedurálnu náhradu v držiaku vymení za model, len čo je model k dispozícii (a svet medzitým nebol prestavaný) */
+let WORLD_ID = 0;
+function swapProp(holder, fallback, k, place) {
+  const wid = WORLD_ID;
+  withModel(k, () => {
+    if (wid !== WORLD_ID) return;
+    const m = propMesh(k); if (place) place(m);
+    if (fallback) { holder.remove(fallback); fallback.traverse(o => { if (o.geometry && !o.userData.shared) o.geometry.dispose(); }); }
+    holder.add(m);
   });
 }
 
@@ -1480,7 +1668,10 @@ function buildKotolna() {
   addBox(o, 4.1, 0.38, 4.3, 1.3, 0.78, 0.7);
   schoolChair(gb, 4.0, 3.6, -Math.PI / 2);
   gb.box(0.9, 0.03, 0.26, 2.3, 1.42, 4.6, COL.woodDark);
-  gb.box(0.34, 0.2, 0.14, 2.2, 1.54, 4.6, 0x4a3a2c); gb.disc(0.05, 0.01, V3(2.12, 1.55, 4.53), V3(0, 0, -1), 0xc9b98a, 12); gb.rod(V3(2.32, 1.64, 4.6), V3(2.5, 1.95, 4.6), 0.006, 0x999999);
+  const rdb = new GB(true);
+  rdb.box(0.34, 0.2, 0.14, 2.2, 1.54, 4.6, 0x4a3a2c); rdb.disc(0.05, 0.01, V3(2.12, 1.55, 4.53), V3(0, 0, -1), 0xc9b98a, 12); rdb.rod(V3(2.32, 1.64, 4.6), V3(2.5, 1.95, 4.6), 0.006, 0x999999);
+  const radio = new THREE.Group(); g.add(radio); const radioFb = rdb.mesh(); radio.add(radioFb);
+  swapProp(radio, radioFb, 'radio', m => m.position.set(2.2, 1.435, 4.62));
   gb.rod(V3(1.86, 0.02, 2.25), V3(1.82, 1.5, 2.3), 0.018, COL.wood); gb.box(0.3, 0.14, 0.06, 1.86, 0.08, 2.25, 0x9b7a3a);
   gb.cyl(0.045, 0.04, 0.09, 12, 4.55, 0.825, 4.35, 0xe9e2d0); gb.torus(0.03, 0.008, 6, 10, 4.6, 0.83, 4.35, 0xe9e2d0, 0, 0, Math.PI / 2);
   /* tabuľka s kľúčmi */
@@ -1755,7 +1946,9 @@ function buildDvor() {
   const bgeo = new THREE.IcosahedronGeometry(0.11, 1), bc = new Float32Array(bgeo.attributes.position.count * 3);
   for (let f = 0; f < bc.length / 9; f++) { const k = (f % 5 === 0) ? 0.05 : 0.92; for (let v = 0; v < 9; v++) bc[f * 9 + v] = k; }
   bgeo.setAttribute('color', new THREE.BufferAttribute(bc, 3));
-  const ball = new THREE.Mesh(bgeo, MAT.vc); ball.position.set(-0.6, 0.12, -3.4); g.add(ball); addFloater(ball, 0.03, 0.8, V3(0.2, 0.5, 0));
+  const ball = new THREE.Group(); ball.position.set(-0.6, 0.12, -3.4); g.add(ball);
+  const ballFb = new THREE.Mesh(bgeo, MAT.vc); ball.add(ballFb); swapProp(ball, ballFb, 'ball');
+  addFloater(ball, 0.03, 0.8, V3(0.2, 0.5, 0));
   /* lupene čerešne: padajú, ale nikdy nedopadnú */
   const N = 80, pp = new Float32Array(N * 3), pd = [];
   for (let i = 0; i < N; i++) { const d = { x: 1.8 + rr(-1.5, 1.5), y: rr(0.4, 3.2), z: -1.2 + rr(-1.4, 1.4), v: rr(0.15, 0.35), ph: rnd() * TAU }; pd.push(d); }
@@ -1798,10 +1991,12 @@ function buildStrecha() {
   gb.rod(V3(-3.4, 0, -2.6), V3(-3.4, 3.4, -2.6), 0.025, 0x8a8f94);
   for (const [y, w] of [[2.6, 1.1], [2.9, 0.9], [3.2, 0.7]]) gb.rod(V3(-3.4 - w / 2, y, -2.6), V3(-3.4 + w / 2, y, -2.6), 0.012, 0x8a8f94);
   /* ďalekohľad */
-  const top = V3(-1.5, 1.05, 1.0);
-  for (let i = 0; i < 3; i++) { const a = i / 3 * TAU + 0.3; gb.rod(top, V3(-1.5 + Math.cos(a) * 0.45, 0, 1.0 + Math.sin(a) * 0.45), 0.018, 0x3a3a3a); }
-  gb.rod(V3(-1.5, 0.98, 1.38), V3(-1.5, 1.6, 0.6), 0.085, 0xd8d2c0, 12); gb.rod(V3(-1.5, 1.6, 0.6), V3(-1.5, 1.7, 0.47), 0.1, 0x2a2a2a, 12);
-  gb.rod(V3(-1.5, 0.92, 1.46), V3(-1.5, 0.99, 1.38), 0.03, 0x2a2a2a);
+  const tsb = new GB(true), top = V3(-1.5, 1.05, 1.0);
+  for (let i = 0; i < 3; i++) { const a = i / 3 * TAU + 0.3; tsb.rod(top, V3(-1.5 + Math.cos(a) * 0.45, 0, 1.0 + Math.sin(a) * 0.45), 0.018, 0x3a3a3a); }
+  tsb.rod(V3(-1.5, 0.98, 1.38), V3(-1.5, 1.6, 0.6), 0.085, 0xd8d2c0, 12); tsb.rod(V3(-1.5, 1.6, 0.6), V3(-1.5, 1.7, 0.47), 0.1, 0x2a2a2a, 12);
+  tsb.rod(V3(-1.5, 0.92, 1.46), V3(-1.5, 0.99, 1.38), 0.03, 0x2a2a2a);
+  const scope = new THREE.Group(); g.add(scope); const scopeFb = tsb.mesh(); scope.add(scopeFb);
+  swapProp(scope, scopeFb, 'telescope', m => m.position.set(-1.5, 0, 1.0));
   /* lavička */
   for (let i = 0; i < 3; i++) gb.box(1.5, 0.03, 0.11, 1.6, 0.45, 2.15 + i * 0.13, COL.wood);
   gb.box(1.5, 0.11, 0.03, 1.6, 0.62, 2.05, COL.wood); gb.box(1.5, 0.11, 0.03, 1.6, 0.78, 2.03, COL.wood);
@@ -1852,9 +2047,12 @@ function buildChodba() {
   /* triedna fotka: rám */
   gb.box(1.06, 0.76, 0.04, 3.0, 1.75, 2.38, 0x3a2a1c);
   /* klavír */
-  gb.box(1.5, 1.25, 0.55, 4.75, 0.625, 2.15, 0x15130f); gb.box(1.42, 0.08, 0.32, 4.75, 0.76, 1.74, 0x15130f);
-  gb.box(1.32, 0.025, 0.14, 4.75, 0.81, 1.66, 0xf2efe6);
-  for (let i = 0; i < 20; i++) { if ([2, 6, 9, 13, 16].includes(i % 21)) continue; gb.box(0.025, 0.025, 0.085, 4.12 + i * 0.066, 0.83, 1.7, 0x0e0d0c); }
+  const pnb = new GB(true);
+  pnb.box(1.5, 1.25, 0.55, 4.75, 0.625, 2.15, 0x15130f); pnb.box(1.42, 0.08, 0.32, 4.75, 0.76, 1.74, 0x15130f);
+  pnb.box(1.32, 0.025, 0.14, 4.75, 0.81, 1.66, 0xf2efe6);
+  for (let i = 0; i < 20; i++) { if ([2, 6, 9, 13, 16].includes(i % 21)) continue; pnb.box(0.025, 0.025, 0.085, 4.12 + i * 0.066, 0.83, 1.7, 0x0e0d0c); }
+  const piano = new THREE.Group(); g.add(piano); const pianoFb = pnb.mesh(); piano.add(pianoFb);
+  swapProp(piano, pianoFb, 'piano', m => { m.position.set(4.75, 0, 2.05); m.rotation.y = Math.PI; });
   gb.box(0.8, 0.05, 0.36, 4.75, 0.5, 1.2, 0x15130f); for (const x of [4.42, 5.08]) gb.box(0.05, 0.5, 0.32, x, 0.25, 1.2, 0x15130f);
   addBox(o, 4.75, 0.625, 2.12, 1.5, 1.25, 0.62);
   /* nástenka */
@@ -1943,10 +2141,15 @@ function buildSatna() {
   /* prezuvky: obe ľavé */
   const sl = new GB();
   for (const dx of [0, 0.15]) { sl.box(0.1, 0.03, 0.25, dx, 0, 0, 0x2f5f8a); sl.box(0.06, 0.03, 0.06, dx + 0.025, 0.012, 0.12, 0x2f5f8a); sl.box(0.105, 0.04, 0.05, dx, 0.035, -0.02, 0x1d3f5e); }
-  const slm = sl.mesh(); slm.position.set(0.55, 0.03, -0.32); slm.rotation.y = 0.3; g.add(slm);
+  const slm = new THREE.Group(); slm.position.set(0.55, 0.03, -0.32); slm.rotation.y = 0.3; g.add(slm);
+  const slFb = sl.mesh(); slm.add(slFb);
+  /* z modelu dve rovnaké papuče, teda naozaj obe ľavé */
+  swapProp(slm, slFb, 'slipper', m => { m.position.set(0, -0.03, 0); const m2 = propMesh('slipper'); m2.position.set(0.15, -0.03, 0.025); m2.rotation.y = -0.06; slm.add(m2); });
   /* obojok na klietke */
   const col = new GB(); col.torus(0.09, 0.016, 6, 18, 0, 0, 0, 0xb03a2e); col.disc(0.03, 0.006, V3(0, -0.12, 0.004), V3(0, 0, 1), 0xd8b45a, 10);
-  const cm = col.mesh(MAT.iron); cm.position.set(-1.3, 1.45, 1.25); g.add(cm); addFloater(cm, 0.02, 0.6, V3(0, 0.3, 0));
+  const cm = new THREE.Group(); cm.position.set(-1.3, 1.45, 1.25); g.add(cm);
+  const cmFb = col.mesh(MAT.iron); cm.add(cmFb); swapProp(cm, cmFb, 'collar');
+  addFloater(cm, 0.02, 0.6, V3(0, 0.3, 0));
   addIt({ id: 'lavicka', kind: 'truth', pos: W(o, 0.2, 0.5, -0.6), range: 2.4, glow: 0xa9dcff });
   addIt({ id: 'prezuvky', kind: 'memory', pos: W(o, 0.6, 0.1, -0.3), range: 2.2, glow: 0xf2b56f });
   addIt({ id: 'obojok', kind: 'memory', pos: V3(), follow: cm, range: 2.4, glow: 0xf2b56f });
@@ -1967,7 +2170,9 @@ function buildVoid() {
   bk.rod(V3(-0.05, 0.02, 0), V3(0.38, 0.45, 0), 0.02, red); bk.rod(V3(0.38, 0.45, 0), V3(0.5, 0, 0), 0.02, red); bk.rod(V3(-0.5, 0, 0), V3(-0.15, 0.45, 0), 0.016, red);
   bk.rod(V3(0.38, 0.45, 0), V3(0.36, 0.62, 0), 0.016, 0x555555); bk.rod(V3(0.36, 0.62, -0.22), V3(0.36, 0.62, 0.22), 0.014, 0x555555);
   bk.box(0.22, 0.05, 0.1, -0.17, 0.53, 0, 0x1a1a1a); bk.rod(V3(-0.15, 0.45, 0), V3(-0.17, 0.52, 0), 0.014, 0x555555);
-  const bkm = bk.mesh(MAT.iron); bkm.position.set(-13, 6, -13); world.add(bkm); addFloater(bkm, 0.35, 0.22, V3(0.1, 0.18, 0.06));
+  const bkm = new THREE.Group(); bkm.position.set(-13, 6, -13); world.add(bkm);
+  const bkFb = bk.mesh(MAT.iron); bkm.add(bkFb); swapProp(bkm, bkFb, 'bicycle', m => { m.position.y = -0.4; m.rotation.y = Math.PI / 2; });
+  addFloater(bkm, 0.35, 0.22, V3(0.1, 0.18, 0.06));
   /* papiere okolo triedy */
   const pm = new THREE.MeshStandardMaterial({ color: 0xf1ece0, roughness: 0.9, side: THREE.DoubleSide }); perBuild.push(pm);
   for (let i = 0; i < 16; i++) {
@@ -2095,13 +2300,14 @@ function buildDust() {
 function disposeWorld() {
   if (!world) return;
   scene.remove(world);
-  world.traverse(o => { if (o.isSprite) { o.material.dispose(); return; } if (o.geometry) o.geometry.dispose(); });
+  world.traverse(o => { if (o.isSprite) { o.material.dispose(); return; } if (o.geometry && !o.userData.shared) o.geometry.dispose(); });
   perBuild.forEach(x => x && x.dispose && x.dispose());
   perBuild.length = 0; LANG_TEX.length = 0;
   world = null;
 }
 function buildWorld() {
   disposeWorld();
+  WORLD_ID++;
   DETAIL = QUALITY === 'low' ? 1 : 2;
   Object.assign(CAL, { revealed: false, redraw: null, tag: null, note: null });
   rnd = mulberry32(19931);
@@ -2125,9 +2331,11 @@ function buildWorld() {
   const red = new THREE.Color(0xc0302a), grn = new THREE.Color(0x7fb23a);
   for (let i = 0; i < ap.count; i++) { const c = ap.getX(i) > 0 ? red : grn; ac.set([c.r, c.g, c.b], i * 3); }
   ag.setAttribute('color', new THREE.BufferAttribute(ac, 3));
-  const apple = new THREE.Mesh(ag, MAT.vc); apple.scale.set(1, 0.9, 1); apple.position.set(3.85, 0.86, -1.15); tg.add(apple);
-  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.006, 0.04, 6), MAT.vc); stem.position.y = 0.065; apple.add(stem);
-  const leaf = new GB(); leaf.sphere(0.024, 0.016, 0.075, 0, 0x5e8f2e, 10, 6, 1, 0.22, 0.5, 0, 0, -0.5); apple.add(leaf.mesh());
+  const apple = new THREE.Group(); apple.position.set(3.85, 0.86, -1.15); tg.add(apple);
+  const appleFb = new THREE.Mesh(ag, MAT.vc); appleFb.scale.set(1, 0.9, 1); apple.add(appleFb);
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.006, 0.04, 6), MAT.vc); stem.position.y = 0.065; appleFb.add(stem);
+  const leaf = new GB(); leaf.sphere(0.024, 0.016, 0.075, 0, 0x5e8f2e, 10, 6, 1, 0.22, 0.5, 0, 0, -0.5); appleFb.add(leaf.mesh());
+  swapProp(apple, appleFb, 'apple', m => { m.material = appleMat(); });
   addFloater(apple, 0.03, 0.7, V3(0, 0.6, 0));
   addIt({ id: 'jablko', kind: 'memory', pos: V3(), follow: apple, range: 2.4, glow: 0xf2b56f, glowSize: 0.6 });
   buildKniznica(); buildDvor(); buildStrecha(); buildChodba(); buildSatna(); buildFyzika(); buildTelocvicna(); buildRiaditelna();
@@ -2471,7 +2679,9 @@ function buildRiaditelna() {
   /* okno so žalúziami na severnej stene */
   gb.box(1.4, 1.0, 0.05, -0.8, 1.9, -2.48, 0x0a0d12); for (let k = 0; k < 10; k++) gb.box(1.36, 0.035, 0.03, -0.8, 1.45 + k * 0.095, -2.44, 0xd8d2c4, 0.5, 0, 0);
   /* telefón, lampa */
-  gb.box(0.22, 0.08, 0.18, 1.9, 0.85, -0.25, 0x151515); gb.box(0.22, 0.04, 0.05, 1.9, 0.92, -0.3, 0x151515);
+  const phb = new GB(true); phb.box(0.22, 0.08, 0.18, 1.9, 0.85, -0.25, 0x151515); phb.box(0.22, 0.04, 0.05, 1.9, 0.92, -0.3, 0x151515);
+  const phone = new THREE.Group(); g.add(phone); const phoneFb = phb.mesh(); phone.add(phoneFb);
+  swapProp(phone, phoneFb, 'telephone', m => { m.position.set(1.95, 0.81, -0.27); m.rotation.y = 0.25; });
   gb.box(0.14, 0.03, 0.14, 0.75, 0.82, -0.3, 0x2a2a2a); gb.rod(V3(0.75, 0.83, -0.3), V3(0.85, 1.15, -0.3), 0.012, 0x2a2a2a); gb.cone(0.12, 0.14, 12, 0.88, 1.18, -0.3, 0x1f5a3a);
   radiator(gb, -2.98, 0.45, -1.3, 'z', 10);
   g.add(gb.mesh());
@@ -3841,15 +4051,15 @@ function tickScripts(dt) {
 function clearScripts() { waits.length = 0; anims.length = 0; }
 
 /* ---------- Školník ---------- */
-const K = { group: null, mat: null, broom: null, halo: null, a: 0, target: 0, auto: null, faceP: true, sweep: true, baseY: 0 };
-/* postava zo svetla: hladký model (plášť, ruky, hlava), vykreslený okrajovým svetlom */
+const K = { group: null, mat: null, U: null, body: null, broom: null, broomRest: 0, sweepAxis: 'y', halo: null, a: 0, target: 0, auto: null, faceP: true, sweep: true, baseY: 0 };
+/* procedurálne náhrady postáv (keď sa model z Higgsfieldu nenačíta): hladký tvar z rotačných profilov a rúrok */
 function armTube(gb, sx, shoulder, elbow, wrist, r, W) {
   gb.bend([V3(sx * shoulder[0], shoulder[1], shoulder[2]), V3(sx * elbow[0], elbow[1], elbow[2]), V3(sx * wrist[0], wrist[1], wrist[2])], r, W, 18, 10);
   gb.sphere(r * 1.05, sx * shoulder[0], shoulder[1], shoulder[2], W, 12, 10);
   gb.sphere(r * 0.95, sx * elbow[0], elbow[1], elbow[2], W, 10, 8);
 }
-function buildKeeperFigure(core, rim, scale = 1) {
-  const mat = rimMaterial(core, rim), gb = new GB(), W = 0xffffff;
+function keeperFigureGeo() {
+  const gb = new GB(), W = 0xffffff;
   for (const sx of [-1, 1]) {
     gb.sphere(0.068, sx * 0.105, 0.042, 0.05, W, 14, 8, 1, 0.6, 1.8);
     gb.cyl(0.066, 0.074, 0.58, 14, sx * 0.105, 0.34, 0, W);
@@ -3871,13 +4081,30 @@ function buildKeeperFigure(core, rim, scale = 1) {
   armTube(gb, 1, [0.205, 1.43, 0], [0.3, 1.16, 0.05], [0.25, 0.97, 0.22], 0.052, W);
   gb.sphere(0.046, -0.27, 0.825, 0.11, W, 12, 10, 0.75, 1.3, 0.6);
   gb.sphere(0.047, 0.255, 0.925, 0.255, W, 12, 10, 0.85, 1.05, 0.75);
-  const body = new THREE.Mesh(gb.build(), mat);
-  const g = new THREE.Group(); g.add(body); g.scale.setScalar(scale);
-  return { g, mat, body };
+  /* čiapka */
+  gb.lathe([[0.0, 1.84], [0.126, 1.84], [0.131, 1.878], [0.127, 1.923], [0.103, 1.956], [0.055, 1.971], [0.0, 1.974]], 26, 0, 0, 0, W);
+  gb.add(new THREE.CylinderGeometry(0.142, 0.142, 0.012, SEG(18), 1, false, -Math.PI / 2.5, Math.PI / 1.25), W, 0, 1.846, 0.048, 0.16, 0, 0);
+  return gb.build();
 }
-/* Ema: menšia postava, sveter, sukňa, vrkoč */
-function buildGirlFigure(core, rim, scale = 1) {
-  const mat = rimMaterial(core, rim), gb = new GB(), W = 0xffffff;
+/* šikmá metla procedurálnej postavy: rúčka, viazanie, metlica z prútia */
+function broomGeoTilted() {
+  const bb = new GB(), W = 0xffffff, top = V3(-0.33, 1.52, -0.2), dir = top.clone().normalize(), q = new THREE.Quaternion().setFromUnitVectors(Y_UP, dir), eu = new THREE.Euler().setFromQuaternion(q);
+  bb.rod(dir.clone().multiplyScalar(0.26), top, 0.016, W, 10);
+  bb.lathe([[0.0, 0.0], [0.14, 0.0], [0.15, 0.025], [0.105, 0.17], [0.05, 0.27], [0.03, 0.3]], 20, 0, 0, 0, W, eu.x, eu.y, eu.z, 1, 1, 0.32);
+  const q2 = q.clone().multiply(new THREE.Quaternion().setFromAxisAngle(V3(1, 0, 0), Math.PI / 2));
+  bb.addQ(new THREE.TorusGeometry(0.034, 0.008, SEG(6), SEG(14)), W, dir.clone().multiplyScalar(0.25), q2);
+  return bb.build();
+}
+/* rovná metla (keď je postava z modelu, ale model metly chýba) */
+function broomGeoStraight() {
+  const bb = new GB(), W = 0xffffff;
+  bb.cyl(0.016, 0.016, 1.05, 10, 0, 0.8, 0, W);
+  bb.lathe([[0.0, 0.0], [0.14, 0.0], [0.15, 0.025], [0.105, 0.17], [0.05, 0.27], [0.03, 0.3]], 20, 0, 0, 0, W, 0, 0, 0, 1, 1, 0.45);
+  bb.torus(0.034, 0.008, 6, 14, 0, 0.27, 0, W, Math.PI / 2, 0, 0);
+  return bb.build();
+}
+function girlFigureGeo() {
+  const gb = new GB(), W = 0xffffff;
   for (const sx of [-1, 1]) {
     gb.sphere(0.047, sx * 0.064, 0.03, 0.03, W, 12, 8, 1, 0.6, 1.6);
     gb.cyl(0.035, 0.041, 0.42, 12, sx * 0.064, 0.25, 0, W);
@@ -3896,28 +4123,52 @@ function buildGirlFigure(core, rim, scale = 1) {
   armTube(gb, 1, [0.13, 0.95, 0], [0.17, 0.79, 0.03], [0.16, 0.64, 0.08], 0.032, W);
   gb.sphere(0.03, -0.225, 1.26, 0.11, W, 10, 8, 0.75, 1.25, 0.6);
   gb.sphere(0.03, 0.16, 0.6, 0.09, W, 10, 8, 0.75, 1.25, 0.6);
-  const body = new THREE.Mesh(gb.build(), mat);
-  const g = new THREE.Group(); g.add(body); g.scale.setScalar(scale);
-  return { g, mat, body };
+  return gb.build();
+}
+function disposeGhost(o) { o.traverse(c => { if (c.material) c.material.dispose(); if (c.geometry && !c.userData.shared) c.geometry.dispose(); }); }
+/* Ema: menšia postava, sveter s jeleňom, sukňa, vrkoč; z modelu alebo z náhrady */
+function buildGirlFigure(core, rim) {
+  const U = ghostUniforms(core, rim), M = MODELS.ema, geo = M ? M.geo : girlFigureGeo();
+  const p = M ? ghostPair(geo, U, M.map, 1.45, 0.53, { mapMix: 0.7 }) : ghostPair(geo, U, null, 1.3, 0.53, { hole: 0.1 });
+  const g = new THREE.Group(), body = new THREE.Group(); g.add(body);
+  body.add(p.g); body.add(ghostMotes(geo, U, M ? 520 : 380, 23));
+  if (M) body.traverse(c => { if (c.isMesh) c.userData.shared = true; });
+  return { g, mat: p.mat, U, body };
+}
+/* telo a metla Školníka; zavolá sa znova, keď dorazí model, a zachová viditeľnosť metly */
+function keeperParts() {
+  const g = K.group, U = K.U, broomVis = K.broom ? K.broom.visible : true;
+  for (const o of [K.body, K.broom]) if (o) { g.remove(o); disposeGhost(o); }
+  const M = MODELS.caretaker, B = MODELS.broom;
+  const geo = M ? M.geo : keeperFigureGeo();
+  const p = M ? ghostPair(geo, U, M.map, 1.84, 0.37, { mapMix: 0.55 }) : ghostPair(geo, U, null, 1.97, 0.37, { hole: 0.1 });
+  const body = new THREE.Group(); body.add(p.g); body.add(ghostMotes(geo, U, M ? 650 : 480, 11));
+  if (M) p.g.traverse(c => { if (c.isMesh) c.userData.shared = true; });
+  g.add(body);
+  /* metla: pri modeli v pravej ruke (−x), spodkom odklonená von a trochu dopredu; zametá okolo ruky */
+  const bp = new THREE.Group();
+  if (M) {
+    const bg = B ? B.geo : broomGeoStraight(), q = B ? ghostPair(bg, U, B.map, 1.32, 0.71, { mapMix: 0.45, hole: 0.12 }) : ghostPair(bg, U, null, 1.32, 0.71, { hole: 0.1 });
+    if (B) q.g.traverse(c => { if (c.isMesh) c.userData.shared = true; });
+    q.g.position.y = -0.72; bp.add(q.g);
+    bp.position.set(-0.33, 0.76, 0.04); bp.rotation.set(-0.14, 0, -0.3);
+    Object.assign(K, { broomRest: -0.3, sweepAxis: 'z' });
+  } else {
+    bp.add(ghostPair(broomGeoTilted(), U, null, 1.6, 0.71, { hole: 0.1 }).g);
+    bp.position.set(0.45, 0.03, 0.38);
+    Object.assign(K, { broomRest: 0, sweepAxis: 'y' });
+  }
+  bp.visible = broomVis; g.add(bp);
+  Object.assign(K, { body, broom: bp, mat: p.mat });
 }
 function buildKeeper() {
-  const f = buildKeeperFigure(0x05070b, 0xffd6a0);
-  const W = 0xffffff;
-  const cap = new GB();
-  cap.lathe([[0.0, 1.84], [0.126, 1.84], [0.131, 1.878], [0.127, 1.923], [0.103, 1.956], [0.055, 1.971], [0.0, 1.974]], 26, 0, 0, 0, W);
-  cap.add(new THREE.CylinderGeometry(0.142, 0.142, 0.012, SEG(18), 1, false, -Math.PI / 2.5, Math.PI / 1.25), W, 0, 1.846, 0.048, 0.16, 0, 0);
-  f.g.add(new THREE.Mesh(cap.build(), f.mat));
-  /* metla: rúčka, viazanie, metlica z prútia */
-  const bb = new GB(), top = V3(-0.33, 1.52, -0.2), dir = top.clone().normalize(), q = new THREE.Quaternion().setFromUnitVectors(Y_UP, dir), eu = new THREE.Euler().setFromQuaternion(q);
-  bb.rod(dir.clone().multiplyScalar(0.26), top, 0.016, W, 10);
-  bb.lathe([[0.0, 0.0], [0.14, 0.0], [0.15, 0.025], [0.105, 0.17], [0.05, 0.27], [0.03, 0.3]], 20, 0, 0, 0, W, eu.x, eu.y, eu.z, 1, 1, 0.32);
-  const q2 = q.clone().multiply(new THREE.Quaternion().setFromAxisAngle(V3(1, 0, 0), Math.PI / 2));
-  bb.addQ(new THREE.TorusGeometry(0.034, 0.008, SEG(6), SEG(14)), W, dir.clone().multiplyScalar(0.25), q2);
-  const broom = new THREE.Mesh(bb.build(), f.mat);
-  const bp = new THREE.Group(); bp.position.set(0.45, 0.03, 0.38); bp.add(broom); f.g.add(bp);
-  const halo = glow(0xffd6a0, 3.0, 0.22); halo.position.y = 1.2; f.g.add(halo);
-  f.g.visible = false; scene.add(f.g);
-  Object.assign(K, { group: f.g, mat: f.mat, broom: bp, halo });
+  const g = new THREE.Group(); g.visible = false; scene.add(g);
+  const halo = glow(0xffd6a0, 3.0, 0.22); halo.position.y = 1.2; g.add(halo);
+  Object.assign(K, { group: g, U: ghostUniforms(0x05070b, 0xffd6a0), halo });
+  keeperParts();
+  /* ak modely ešte nedorazili, vymenia sa za behu */
+  if (MODELS.caretaker === undefined) withModel('caretaker', keeperParts);
+  if (MODELS.broom === undefined) withModel('broom', () => { if (MODELS.caretaker) keeperParts(); });
 }
 const _kv = V3(), _ndc = V3();
 function onScreen(pos, maxDist) {
@@ -3934,10 +4185,12 @@ function keeperHide() { K.target = 0; K.auto = null; }
 function updateKeeper(dt, t) {
   if (!K.group) return;
   K.a += clamp(K.target - K.a, -dt * 1.1, dt * 1.1);
-  K.mat.uniforms.uOpacity.value = K.a; K.mat.uniforms.uTime.value = t; K.halo.material.opacity = 0.22 * K.a;
+  /* pri miznutí sa fluktuácia rozpadá: pribúda dier a iskričky odlietajú ďalej */
+  K.U.uOpacity.value = K.a; K.U.uTime.value = t; K.U.uFade.value = 1 - K.a; K.halo.material.opacity = 0.22 * K.a;
   K.group.visible = K.a > 0.01;
   if (!K.group.visible) return;
-  K.broom.rotation.y = K.sweep ? Math.sin(t * 1.8) * 0.14 : 0;
+  const sw = K.sweep ? Math.sin(t * 1.8) : 0;
+  if (K.sweepAxis === 'z') K.broom.rotation.z = K.broomRest + sw * 0.09; else K.broom.rotation.y = sw * 0.14;
   K.group.position.y = K.baseY + Math.sin(t * 0.9) * 0.05;
   if (K.faceP) { const dx = camera.position.x - K.group.position.x, dz = camera.position.z - K.group.position.z; K.group.rotation.y = angDamp(K.group.rotation.y, Math.atan2(dx, dz), 3, dt); }
   if (K.auto && G.phase === 'play') {
@@ -4220,6 +4473,7 @@ function disposeScene(s) {
   if (!s) return;
   s.traverse(o => {
     if (o.isSprite) { o.material.dispose(); return; }
+    if (o.userData.shared) return; /* geometria a textúra z načítaného modelu sa použijú znova */
     if (o.geometry) o.geometry.dispose();
     if (o.material && !Object.values(MAT).includes(o.material)) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
   });
@@ -4413,6 +4667,17 @@ function kid(gb, cx, cz, R) {
     gb.sphere(0.033, cx + 0.335, 0.775, cz + s * 0.08, skin, 10, 8, 1.3, 0.6, 1);
   }
 }
+/* spolužiak z modelu: sedí na stoličke (sedadlo vo výške 0.465 m), tvárou k tabuli (+x);
+   zrkadlenie, mierna zmena veľkosti a iný odtieň oblečenia, aby trieda nevyzerala ako klony */
+function kidModel(cx, cz, R) {
+  const girl = R() < 0.5, k = girl ? 'kidGirl' : 'kidBoy', s = 0.95 + R() * 0.1;
+  const m = new THREE.Mesh(MODELS[k].geo, kidMat(k, R() < 0.3 ? 0 : R()));
+  m.userData.shared = true;
+  m.scale.set(R() < 0.5 ? -s : s, s, s);
+  m.rotation.y = Math.PI / 2 + (R() - 0.5) * 0.16;
+  m.position.set(cx + 0.09, 0.465 - (girl ? 0.33 : 0.365) * s, cz);
+  return m;
+}
 function buildSunny() {
   const s = new THREE.Scene(); s.background = new THREE.Color(0x9fd0ff);
   s.add(new THREE.HemisphereLight(0xdff0ff, 0x7a6048, 1.5));
@@ -4426,13 +4691,14 @@ function buildSunny() {
   tr.board.draw(TR().sunnyBoard, 1, TR().sig);
   s.traverse(o => { if (o.material && o.material.isMeshStandardMaterial) paintify(o.material, 0.6); });
   /* spolužiaci */
-  const kids = new GB(), R = mulberry32(55);
+  /* v novom vesmíre sú to skutoční ľudia, preto pevní, nie duchovia; z modelov z Higgsfieldu, inak procedurálne */
+  const kids = new GB(), R = mulberry32(55), useM = !!(MODELS.kidBoy && MODELS.kidGirl);
   for (const x of [-3.6, -1.9, -0.2, 1.5]) for (const z of [-2.4, 0, 2.4]) for (const dz of [-0.3, 0.3]) {
     if (x === -1.9 && z === 0) continue;
     if (R() < 0.12) continue;
-    kid(kids, x - 0.52, z + dz, R);
+    if (useM) g.add(kidModel(x - 0.52, z + dz, R)); else kid(kids, x - 0.52, z + dz, R);
   }
-  g.add(kids.mesh());
+  if (!useM) g.add(kids.mesh());
   /* vonku: obloha, kopce, strom, oblaky */
   const sky = canvasTex(4, 256, c => { const gr = c.createLinearGradient(0, 0, 0, 256); gr.addColorStop(0, '#4f8fdc'); gr.addColorStop(0.75, '#bfdcff'); gr.addColorStop(1, '#e8f3ff'); c.fillStyle = gr; c.fillRect(0, 0, 4, 256); });
   const skyM = new THREE.Mesh(new THREE.PlaneGeometry(120, 50), new THREE.MeshBasicMaterial({ map: sky })); skyM.position.set(0, 10, -40); s.add(skyM);
@@ -4599,13 +4865,14 @@ function spawnEma() {
 }
 const _cr = V3();
 function updateCatch(dt, t) {
+  if (EMA.fig && EMA.fig.g.visible) EMA.fig.U.uTime.value = t;
   const C = G.catch;
   if (!C || !EMA.fig || G.phase !== 'play') { if (!C) updateCompass(null); return; }
   updateCompass(_cr.copy(C.pos).add(V3(0, 1.75, 0)));
   if (UI.journalOpen) return;
   C.life -= dt; const k = clamp(C.life / C.max, 0, 1);
   EMA.fig.mat.uniforms.uOpacity.value = (0.3 + 0.7 * k) * (0.7 + 0.3 * Math.sin(t * 13) * Math.sin(t * 3.1));
-  EMA.fig.mat.uniforms.uTime.value = t; EMA.beam.mat.uniforms.uTime.value = t; EMA.beam.mat.uniforms.uOp.value = 0.25 + 0.45 * k; EMA.beam.halo.material.opacity = 0.5 * k;
+  EMA.fig.U.uFade.value = (1 - k) * 0.55; EMA.beam.mat.uniforms.uTime.value = t; EMA.beam.mat.uniforms.uOp.value = 0.25 + 0.45 * k; EMA.beam.halo.material.opacity = 0.5 * k;
   C.shimmerT -= dt;
   if (C.shimmerT <= 0) { C.shimmerT = 2.2; _tv.subVectors(C.pos, camera.position); const d = _tv.length(); _cr.set(1, 0, 0).applyQuaternion(camera.quaternion); AU.shimmer(_cr.dot(_tv) / d, 0.05 * clamp(25 / d, 0.25, 1)); }
   if (C.life <= 0) emaLost();
@@ -4625,7 +4892,7 @@ async function caughtEma() {
   removeCatch(); G.phase = 'cine'; P.control = false; $('objectives').hidden = true; $('hud').hidden = true; updateCompass(null);
   const SK = TR().end.skolnik;
   P.focus = EMA.fig.g.position.clone().add(V3(0, 0.9, 0));
-  EMA.fig.mat.uniforms.uOpacity.value = 1; EMA.beam.mat.uniforms.uOp.value = 0.8;
+  EMA.fig.mat.uniforms.uOpacity.value = 1; EMA.fig.U.uFade.value = 0; EMA.beam.mat.uniforms.uOp.value = 0.8;
   AU.chord([293.66, 369.99, 440, 587.33], { a: 1.5, hold: 6, r: 6, vol: 0.035 });
   await say('E', SK.ema, { wait: false, auto: 2.4 }); if (run !== G.run) return;
   await wait(0.3);
@@ -4847,7 +5114,10 @@ async function bootInner(data) {
   setLang(initialLang(), false);
   titleMeta();
   requestAnimationFrame(frame);
+  /* modely z Higgsfieldu sa načítavajú súbežne s písmami; čaká sa najviac 9 s, neskoršie sa doplnia za behu */
+  const models = loadModels();
   await fontsReady();
+  await Promise.race([models, new Promise(r => setTimeout(r, 9000))]);
   buildKeeper(); buildWorld();
   CAM.mode = 'script';
   G.phase = 'title'; READY = true;
@@ -4878,6 +5148,8 @@ window.__ludvik = {
   lowres(pr) { renderer.setPixelRatio(pr); onResize(); },
   gasMorph() { return gasBox ? gasBox.morph : 0; }, setPausedT(v) { setPaused(v); },
   rebuild() { buildWorld(); return true; },
+  models() { const o = {}; for (const k in MODEL_FILES) o[k] = MODELS[k] ? 'ok' : MODELS[k] === null ? 'failed' : 'pending'; return o; },
+  emaAt(x, y, z, ry) { this.figTest(); EMA.fig.g.position.set(x, y, z); EMA.fig.g.rotation.y = ry || 0; return true; },
   figTest() { keeperAt(W(O.K, -1.7, 0, 1.9), { sweep: true }); K.a = 1; if (!EMA.fig) { EMA.fig = buildGirlFigure(0x07051a, 0xc9b8ff); const b = emaBeam(); EMA.fig.g.add(b.g); EMA.beam = b; scene.add(EMA.fig.g); } EMA.fig.g.position.copy(W(O.K, -0.4, 0, 2.6)); EMA.fig.g.rotation.y = 0.4; EMA.fig.g.visible = true; return true; },
   sunTest(x, y, z, lx, ly, lz) { if (!SUN) SUN = buildSunny(); activeScene = SUN.scene; camera.far = 300; camera.updateProjectionMatrix(); CAM.mode = 'script'; G.phase = 'cine'; P.control = false; CAM.pos.set(x, y, z); CAM.look.set(lx, ly, lz); return true; }, camTest(x, y, z, yaw, pitch) { G.phase = 'play'; P.control = true; CAM.mode = 'player'; P.pos.set(x, y, z); P.yaw = yaw; P.pitch = pitch; },
   info() { let n = 0, tri = 0; scene.traverse(o => { if (o.isMesh || o.isPoints || o.isSprite || o.isLine) { n++; if (o.geometry && o.geometry.attributes.position) tri += (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3; } }); return { objects: n, tris: Math.round(tri), mem: renderer.info.memory, progs: renderer.info.programs.length, lights: lamps.length }; },

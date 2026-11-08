@@ -1,0 +1,123 @@
+{
+  "rawDir": "raw",
+  "outDir": "../../models",
+  "models": [
+    {
+      "name": "caretaker",
+      "in": "caretaker_tripo.glb",
+      "rotY": -90,
+      "height": 1.84,
+      "tris": 30000,
+      "tex": 1024
+    },
+    {
+      "name": "ema",
+      "in": "ema_tripo.glb",
+      "rotY": -90,
+      "height": 1.45,
+      "tris": 26000,
+      "tex": 1024
+    },
+    {
+      "name": "kid_boy",
+      "in": "kid_boy_sam.glb",
+      "rotY": 0,
+      "height": 1.18,
+      "crease": 75,
+      "tex": 1024
+    },
+    {
+      "name": "kid_girl",
+      "in": "kid_girl_sam.glb",
+      "rotY": 0,
+      "height": 1.18,
+      "crease": 75,
+      "tex": 1024
+    },
+    {
+      "name": "piano",
+      "in": "piano_sam.glb",
+      "longest": 1.5,
+      "crease": 45,
+      "tris": 10000,
+      "tex": 1024
+    },
+    {
+      "name": "bicycle",
+      "in": "bicycle_sam.glb",
+      "longest": 1.1,
+      "crease": 55,
+      "tex": 1024
+    },
+    {
+      "name": "slipper",
+      "in": "slipper_sam.glb",
+      "longest": 0.22,
+      "crease": 70,
+      "tris": 4000,
+      "tex": 512
+    },
+    {
+      "name": "apple",
+      "in": "apple_sam.glb",
+      "longest": 0.12,
+      "center": true,
+      "crease": 80,
+      "tris": 3000,
+      "tex": 512
+    },
+    {
+      "name": "collar",
+      "in": "collar_sam.glb",
+      "rotX": 90,
+      "longest": 0.2,
+      "center": true,
+      "crease": 60,
+      "tris": 4000,
+      "tex": 512
+    },
+    {
+      "name": "ball",
+      "in": "ball_sam.glb",
+      "longest": 0.22,
+      "center": true,
+      "crease": 80,
+      "tris": 4000,
+      "tex": 512
+    },
+    {
+      "name": "telescope",
+      "in": "telescope_sam.glb",
+      "rotY": 180,
+      "height": 1.45,
+      "crease": 55,
+      "tex": 1024
+    },
+    {
+      "name": "radio",
+      "in": "radio_sam.glb",
+      "rotY": 180,
+      "longest": 0.36,
+      "crease": 45,
+      "tris": 6000,
+      "tex": 512
+    },
+    {
+      "name": "telephone",
+      "in": "telephone_sam.glb",
+      "rotY": 90,
+      "longest": 0.24,
+      "crease": 50,
+      "tris": 5000,
+      "tex": 512
+    },
+    {
+      "name": "broom",
+      "in": "broom_sam.glb",
+      "height": 1.32,
+      "crease": 70,
+      "tris": 5000,
+      "tex": 512
+    }
+  ]
+}

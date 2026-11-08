@@ -1,0 +1,17 @@
+{
+  "name": "ludvik-model-pipeline",
+  "private": true,
+  "description": "Turns raw Higgsfield GLB exports into the game-ready models in ../../models (orient, scale, simplify, WebP, meshopt).",
+  "type": "module",
+  "scripts": {
+    "build": "node process.mjs models.json"
+  },
+  "dependencies": {
+    "@gltf-transform/core": "4.5.1",
+    "@gltf-transform/extensions": "4.5.1",
+    "@gltf-transform/functions": "4.5.1",
+    "meshoptimizer": "1.3.0",
+    "sharp": "0.35.5",
+    "three": "0.160.0"
+  }
+}
